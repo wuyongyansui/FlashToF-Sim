@@ -14,8 +14,7 @@ class NYUSceneLoaderTests(unittest.TestCase):
     def _make_loader(self):
         return NYUDepthV2Loader(
             DATASET_ROOT,
-            output_height=120,
-            output_width=240,
+            expected_size_wh=(640, 480),
             reflectivity_mode="constant",
             constant_reflectivity=0.6,
         )
@@ -45,25 +44,35 @@ class NYUSceneLoaderTests(unittest.TestCase):
             all_ids[650:],
         )
 
-    def test_pair_counts_crop_resize_dtype_and_metric_depth(self):
+    def test_pair_counts_native_identity_dtype_and_metric_depth(self):
         loader = self._make_loader()
         self.assertEqual(len(loader.list_sample_ids("train")), 795)
         self.assertEqual(len(loader.list_sample_ids("val")), 654)
 
         loaded = loader.load("nyu_0000", split="val")
         self.assertEqual(loaded.source_size_wh, (640, 480))
-        self.assertEqual(loaded.crop_box_ltrb, (0, 80, 640, 400))
-        self.assertEqual(loaded.rgb_u8_hwc.shape, (120, 240, 3))
+        self.assertEqual(loaded.geometry_transform, "native_identity")
+        self.assertEqual(loaded.rgb_u8_hwc.shape, (480, 640, 3))
         self.assertEqual(loaded.rgb_u8_hwc.dtype, np.uint8)
-        self.assertEqual(loaded.scene_inputs.depth_m.shape, (120, 240))
-        self.assertEqual(loaded.scene_inputs.depth_m.dtype, np.float32)
-        self.assertTrue(loaded.scene_inputs.depth_m.flags.c_contiguous)
-        self.assertGreater(float(np.min(loaded.scene_inputs.depth_m)), 0.0)
-        self.assertLess(float(np.max(loaded.scene_inputs.depth_m)), 10.1)
+        self.assertEqual(loaded.scene_inputs.depth_z_m.shape, (480, 640))
+        self.assertEqual(loaded.scene_inputs.depth_z_m.dtype, np.float32)
+        self.assertTrue(loaded.scene_inputs.depth_z_m.flags.c_contiguous)
+        self.assertGreater(float(np.min(loaded.scene_inputs.depth_z_m)), 0.0)
+        self.assertLess(float(np.max(loaded.scene_inputs.depth_z_m)), 10.1)
         np.testing.assert_array_equal(
             loaded.scene_inputs.reflectivity,
-            np.full((120, 240), 0.6, dtype=np.float32),
+            np.full((480, 640), 0.6, dtype=np.float32),
         )
+
+    def test_native_size_mismatch_is_rejected_instead_of_resized(self):
+        loader = NYUDepthV2Loader(
+            DATASET_ROOT,
+            expected_size_wh=(240, 120),
+            reflectivity_mode="constant",
+            constant_reflectivity=0.6,
+        )
+        with self.assertRaisesRegex(ValueError, "crop/resize is disabled"):
+            loader.load("nyu_0000", split="val")
 
 
 if __name__ == "__main__":
