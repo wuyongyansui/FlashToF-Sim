@@ -7,6 +7,7 @@ import numpy as np
 from .config import DerivedConfig, SceneInputs, SensorConfig, derive_config
 from .ewh import EquiWidthHistogram, accumulate_ewh
 from .first_photon import sample_first_photon_counts
+from .geometry import RGBIntrinsics, SceneGeometry, build_scene_geometry
 from .reconstruction import MaximumBinReconstruction, reconstruct_maximum_bin
 from .transient import IdealTransient, generate_ideal_transient
 
@@ -20,25 +21,39 @@ class ArrayDiagnostics:
     peak_shift_bins_hw: np.ndarray
     measured_detection_fraction_hw: np.ndarray
     expected_detection_fraction_hw: np.ndarray
-    distance_bias_m_hw: np.ndarray
+    slant_range_bias_m_hw: np.ndarray
+    depth_to_slant_delta_m_hw: np.ndarray
 
 
 @dataclass(frozen=True)
 class SimulationResult:
+    """包含轴向输入、相机几何、斜距真值与首光子 EWH 的完整结果。"""
+
     sensor_config: SensorConfig
     derived_config: DerivedConfig
+    camera_intrinsics: RGBIntrinsics
     scene_inputs: SceneInputs
+    scene_geometry: SceneGeometry
     ideal_transient: IdealTransient
     ewh: EquiWidthHistogram
     reconstruction: MaximumBinReconstruction
     diagnostics: ArrayDiagnostics
 
 
-def run_simulation(sensor_config, scene_inputs):
-    """运行固定阵列链路，不加入校正或额外传感器效应。"""
+def run_simulation(sensor_config, scene_inputs, camera_intrinsics, measured_irf=None):
+    """运行固定单回波阵列链路，不加入校正或额外传感器效应。"""
 
+    if not isinstance(camera_intrinsics, RGBIntrinsics):
+        raise TypeError("camera_intrinsics must be RGBIntrinsics")
     derived = derive_config(sensor_config)
-    transient = generate_ideal_transient(sensor_config, derived, scene_inputs)
+    scene_geometry = build_scene_geometry(scene_inputs, camera_intrinsics)
+    transient = generate_ideal_transient(
+        sensor_config,
+        derived,
+        scene_inputs,
+        scene_geometry,
+        measured_irf=measured_irf,
+    )
     aggregate = sample_first_photon_counts(
         transient.expected_photons_hwt,
         sensor_config.num_laser_periods,
@@ -59,7 +74,10 @@ def run_simulation(sensor_config, scene_inputs):
         reconstruction.peak_bin_hw[reconstruction.valid_hw]
         - ideal_peak[reconstruction.valid_hw]
     )
-    distance_bias = reconstruction.estimated_distance_m_hw - scene_inputs.depth_m
+    slant_range_bias = (
+        reconstruction.estimated_distance_m_hw - scene_geometry.slant_range_m_hw
+    )
+    depth_to_slant_delta = scene_geometry.slant_range_m_hw - scene_inputs.depth_z_m
 
     diagnostics = ArrayDiagnostics(
         ideal_peak_bin_hw=ideal_peak,
@@ -67,12 +85,15 @@ def run_simulation(sensor_config, scene_inputs):
         peak_shift_bins_hw=peak_shift,
         measured_detection_fraction_hw=measured_detection,
         expected_detection_fraction_hw=expected_detection,
-        distance_bias_m_hw=distance_bias.astype(np.float32),
+        slant_range_bias_m_hw=slant_range_bias.astype(np.float32),
+        depth_to_slant_delta_m_hw=depth_to_slant_delta.astype(np.float32),
     )
     return SimulationResult(
         sensor_config=sensor_config,
         derived_config=derived,
+        camera_intrinsics=camera_intrinsics,
         scene_inputs=scene_inputs,
+        scene_geometry=scene_geometry,
         ideal_transient=transient,
         ewh=histogram,
         reconstruction=reconstruction,
@@ -81,7 +102,7 @@ def run_simulation(sensor_config, scene_inputs):
 
 
 def format_diagnostics(result):
-    """返回简洁的完整阵列通量、探测、pile-up 与距离汇总。"""
+    """返回完整阵列几何、探测、pile-up 与斜距误差汇总。"""
 
     valid = result.reconstruction.valid_hw
     diagnostics = result.diagnostics
@@ -91,7 +112,7 @@ def format_diagnostics(result):
     )
     valid_fraction = float(np.mean(valid))
     if np.any(valid):
-        bias = diagnostics.distance_bias_m_hw[valid]
+        bias = diagnostics.slant_range_bias_m_hw[valid]
         shift = diagnostics.peak_shift_bins_hw[valid]
         bias_mean = float(np.mean(bias))
         rmse = float(np.sqrt(np.mean(bias.astype(np.float64) ** 2)))
@@ -107,6 +128,11 @@ def format_diagnostics(result):
         [
             "FULL-ARRAY SIMULATION DIAGNOSTICS",
             "  model                        : earliest photon per pixel per period",
+            "  response                     : {}".format(
+                result.ideal_transient.response_model
+            ),
+            "  depth input semantics        : RGB optical-axis z",
+            "  ToF / inverse-square range   : z / unit-ray d_z (slant range)",
             "  EWH shape                    : {}".format(result.ewh.counts_hwt.shape),
             "  EWH dtype / memory           : {} / {:.2f} MiB".format(
                 result.ewh.counts_hwt.dtype,
@@ -118,19 +144,22 @@ def format_diagnostics(result):
                 float(np.mean(diagnostics.expected_detection_fraction_hw)),
             ),
             "  peak shift bins               : {}".format(shift_summary),
-            "  distance bias mean / RMSE    : {:+.6f} / {:.6f} m".format(
+            "  slant-range bias / RMSE      : {:+.6f} / {:.6f} m".format(
                 bias_mean, rmse
             ),
             "  centre pixel [r,c]           : {}".format(centre),
-            "    true / estimated distance   : {:.6f} / {:.6f} m".format(
-                float(result.scene_inputs.depth_m[centre]),
-                float(result.reconstruction.estimated_distance_m_hw[centre]),
+            "    depth z / true slant range : {:.6f} / {:.6f} m".format(
+                float(result.scene_inputs.depth_z_m[centre]),
+                float(result.scene_geometry.slant_range_m_hw[centre]),
             ),
-            "    ideal / observed peak bin   : {} / {}".format(
+            "    reconstructed slant range  : {:.6f} m".format(
+                float(result.reconstruction.estimated_distance_m_hw[centre])
+            ),
+            "    ideal / observed peak bin  : {} / {}".format(
                 int(diagnostics.ideal_peak_bin_hw[centre]),
                 int(diagnostics.observed_peak_bin_hw[centre]),
             ),
-            "    detected / no-detection     : {} / {}".format(
+            "    detected / no-detection    : {} / {}".format(
                 int(result.ewh.detected_counts_hw[centre]),
                 int(result.ewh.no_detection_counts_hw[centre]),
             ),

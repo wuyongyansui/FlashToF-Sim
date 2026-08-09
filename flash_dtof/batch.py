@@ -6,7 +6,9 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from .config import SensorConfig
+from .config import CameraGeometryConfig, SensorConfig
+from .geometry import load_nyu_rgb_intrinsics
+from .irf import load_measured_irf
 from .pipeline import run_simulation
 from .scene import NYUDepthV2Loader
 
@@ -46,7 +48,7 @@ class NYUBatchConfig:
 
 @dataclass(frozen=True)
 class SceneBatchMetrics:
-    """轻量逐场景指标，不包含 RGB-D、瞬态或 EWH 数组。"""
+    """轻量逐场景指标；误差以 ``z/d_z`` 真实斜距为真值。"""
 
     sample_id: str
     random_seed: int
@@ -63,7 +65,7 @@ class SceneBatchMetrics:
 
 @dataclass(frozen=True)
 class NYUBatchSummary:
-    """数据选择元信息与按像素加权的汇总指标。"""
+    """数据选择元信息与按像素加权的斜距汇总指标。"""
 
     split: str
     selection_start: int
@@ -86,6 +88,7 @@ class NYUBatchSummary:
 def run_nyu_batch(
     sensor_config: SensorConfig,
     batch_config: NYUBatchConfig,
+    camera_config: CameraGeometryConfig,
     progress_callback: Optional[Callable] = None,
 ):
     """让选定的 NYU split 流式通过完整阵列仿真链路。
@@ -97,11 +100,20 @@ def run_nyu_batch(
         raise TypeError("sensor_config must be SensorConfig")
     if not isinstance(batch_config, NYUBatchConfig):
         raise TypeError("batch_config must be NYUBatchConfig")
+    if not isinstance(camera_config, CameraGeometryConfig):
+        raise TypeError("camera_config must be CameraGeometryConfig")
+
+    camera_intrinsics = load_nyu_rgb_intrinsics(camera_config, sensor_config)
+    measured_irf = None
+    if sensor_config.transient_model == "measured_irf":
+        measured_irf = load_measured_irf(
+            sensor_config.measured_irf_path,
+            expected_bin_width_s=sensor_config.bin_width_s,
+        )
 
     loader = NYUDepthV2Loader(
         batch_config.dataset_root,
-        output_height=sensor_config.image_height,
-        output_width=sensor_config.image_width,
+        expected_size_wh=(sensor_config.image_width, sensor_config.image_height),
         reflectivity_mode=batch_config.reflectivity_mode,
         constant_reflectivity=batch_config.constant_reflectivity,
     )
@@ -128,7 +140,12 @@ def run_nyu_batch(
         scene_seed = _derive_scene_seed(sensor_config.random_seed, global_index)
         scene_sensor = replace(sensor_config, random_seed=scene_seed)
         loaded = loader.load(sample_id, split=batch_config.split)
-        result = run_simulation(scene_sensor, loaded.scene_inputs)
+        result = run_simulation(
+            scene_sensor,
+            loaded.scene_inputs,
+            camera_intrinsics,
+            measured_irf=measured_irf,
+        )
         metrics, sums = _summarize_scene(sample_id, scene_seed, result)
         scene_metrics.append(metrics)
 
@@ -196,7 +213,7 @@ def _summarize_scene(sample_id, scene_seed, result):
     )
 
     if valid_pixels:
-        bias = result.diagnostics.distance_bias_m_hw[valid].astype(np.float64)
+        bias = result.diagnostics.slant_range_bias_m_hw[valid].astype(np.float64)
         bias_sum = float(np.sum(bias, dtype=np.float64))
         absolute_error_sum = float(np.sum(np.abs(bias), dtype=np.float64))
         squared_error_sum = float(np.sum(bias * bias, dtype=np.float64))
@@ -260,7 +277,7 @@ def format_batch_summary(summary):
             "  expected detection fraction : {:.6f}".format(
                 summary.expected_detection_fraction
             ),
-            "  distance bias / MAE / RMSE  : {:+.6f} / {:.6f} / {:.6f} m".format(
+            "  slant bias / MAE / RMSE     : {:+.6f} / {:.6f} / {:.6f} m".format(
                 summary.mean_bias_m,
                 summary.mean_absolute_error_m,
                 summary.root_mean_squared_error_m,

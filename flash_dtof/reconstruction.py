@@ -10,7 +10,7 @@ from .ewh import EquiWidthHistogram
 
 @dataclass(frozen=True)
 class MaximumBinReconstruction:
-    """最大计数 bin 图和距离图，二者 shape 均为 ``[H, W]``。"""
+    """最大计数 bin 图和单程斜距图，二者 shape 均为 ``[H, W]``。"""
 
     peak_bin_hw: np.ndarray
     estimated_distance_m_hw: np.ndarray
@@ -27,7 +27,7 @@ def bin_center_time_s(bin_index, bin_width_s):
 
 
 def round_trip_time_to_distance_m(round_trip_time_s):
-    """将秒制往返时间转换为米制单程距离。"""
+    """将秒制往返时间转换为米制单程斜距。"""
 
     times = np.asarray(round_trip_time_s)
     if np.any(times < 0.0):
@@ -36,7 +36,7 @@ def round_trip_time_to_distance_m(round_trip_time_s):
 
 
 def reconstruct_maximum_bin(histogram, bin_width_s):
-    """使用 ``argmax(axis=-1)`` 估计完整阵列距离图。"""
+    """使用 ``argmax(axis=-1)`` 估计完整阵列单程斜距图。"""
 
     if not isinstance(histogram, EquiWidthHistogram):
         raise TypeError("histogram must be EquiWidthHistogram")

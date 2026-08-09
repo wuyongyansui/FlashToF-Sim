@@ -1,4 +1,4 @@
-"""只读空间场景加载与几何适配。"""
+"""只读原生空间场景加载与像素恒等数据契约。"""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,39 +15,46 @@ _SAMPLE_ID_PATTERN = re.compile(r"^nyu_\d{4}$")
 
 @dataclass(frozen=True)
 class LoadedNYUScene:
-    """一个已对齐并适配到指定 SPAD 阵列的 RGB-D 样本。"""
+    """一个保持原生像素网格、不做裁剪或缩放的 RGB-D 样本。"""
 
     sample_id: str
     split: str
     rgb_u8_hwc: np.ndarray
     scene_inputs: SceneInputs
     source_size_wh: tuple
-    crop_box_ltrb: tuple
+    geometry_transform: str
 
 
 class NYUDepthV2Loader:
     """读取成对的 JPEG/float16-NPY NYU Depth V2 轻量样本。
 
-    RGB 与深度使用相同的中心裁剪以匹配目标宽高比。随后 RGB 使用双线性
-    resize，米制深度使用最近邻 resize，避免在前景/背景边界混合出虚假
-    距离。源文件始终只读打开，绝不修改。
+    RGB 与米制轴向深度必须具有同一原生 shape，且必须与 ``expected_size_wh``
+    完全一致。加载器只转换数组 dtype/内存布局，不裁剪、不缩放、不重投影，
+    因而每个原始 NYU 像素对应一个 SPAD 仿真像素。源文件始终只读打开。
     """
 
     def __init__(
         self,
         dataset_root,
-        output_height=120,
-        output_width=240,
+        expected_size_wh=(640, 480),
         reflectivity_mode="constant",
         constant_reflectivity=1.0,
     ):
         self.dataset_root = Path(dataset_root)
-        self.output_height = int(output_height)
-        self.output_width = int(output_width)
+        if (
+            not isinstance(expected_size_wh, (tuple, list))
+            or len(expected_size_wh) != 2
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                for value in expected_size_wh
+            )
+        ):
+            raise ValueError("expected_size_wh must contain positive integer [W, H]")
+        self.expected_size_wh = tuple(expected_size_wh)
         self.reflectivity_mode = reflectivity_mode
         self.constant_reflectivity = float(constant_reflectivity)
-        if self.output_height <= 0 or self.output_width <= 0:
-            raise ValueError("output dimensions must be positive")
         if reflectivity_mode not in ("constant", "luminance_proxy"):
             raise ValueError("reflectivity_mode must be 'constant' or 'luminance_proxy'")
         if not 0.0 <= self.constant_reflectivity <= 1.0:
@@ -115,46 +122,31 @@ class NYUDepthV2Loader:
             raise ValueError("NYU depth must be finite, positive metres")
 
         source_height, source_width = depth.shape
-        crop_box = self._center_crop_box(source_width, source_height)
-        left, top, right, bottom = crop_box
-        rgb_crop = rgb[top:bottom, left:right]
-        depth_crop = np.asarray(depth[top:bottom, left:right], dtype=np.float32)
+        source_size_wh = (source_width, source_height)
+        if source_size_wh != self.expected_size_wh:
+            raise ValueError(
+                "native NYU size {} does not match sensor size {}; crop/resize is disabled".format(
+                    source_size_wh, self.expected_size_wh
+                )
+            )
 
-        resampling = getattr(Image, "Resampling", Image)
-        rgb_resized = Image.fromarray(rgb_crop, mode="RGB").resize(
-            (self.output_width, self.output_height), resample=resampling.BILINEAR
-        )
-        depth_resized = Image.fromarray(depth_crop, mode="F").resize(
-            (self.output_width, self.output_height), resample=resampling.NEAREST
-        )
-        rgb_out = np.ascontiguousarray(np.asarray(rgb_resized, dtype=np.uint8))
-        depth_out = np.ascontiguousarray(np.asarray(depth_resized, dtype=np.float32))
+        rgb_out = np.ascontiguousarray(rgb, dtype=np.uint8)
+        depth_out = np.ascontiguousarray(depth, dtype=np.float32)
         reflectivity = self._make_reflectivity(rgb_out)
 
         return LoadedNYUScene(
             sample_id=sample_id,
             split=split,
             rgb_u8_hwc=rgb_out,
-            scene_inputs=SceneInputs(depth_m=depth_out, reflectivity=reflectivity),
-            source_size_wh=(source_width, source_height),
-            crop_box_ltrb=crop_box,
+            scene_inputs=SceneInputs(depth_z_m=depth_out, reflectivity=reflectivity),
+            source_size_wh=source_size_wh,
+            geometry_transform="native_identity",
         )
-
-    def _center_crop_box(self, source_width, source_height):
-        source_aspect = float(source_width) / source_height
-        target_aspect = float(self.output_width) / self.output_height
-        if source_aspect < target_aspect:
-            crop_height = max(1, int(round(source_width / target_aspect)))
-            top = (source_height - crop_height) // 2
-            return (0, top, source_width, top + crop_height)
-        crop_width = max(1, int(round(source_height * target_aspect)))
-        left = (source_width - crop_width) // 2
-        return (left, 0, left + crop_width, source_height)
 
     def _make_reflectivity(self, rgb_u8_hwc):
         if self.reflectivity_mode == "constant":
             return np.full(
-                (self.output_height, self.output_width),
+                rgb_u8_hwc.shape[:2],
                 self.constant_reflectivity,
                 dtype=np.float32,
             )
