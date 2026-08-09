@@ -1,66 +1,50 @@
-"""Equi-width histogram accumulation from first-photon outcomes."""
+"""聚合首光子采集的等宽直方图数据契约。"""
 
 from dataclasses import dataclass
-from typing import List
 
-from .first_photon import FirstPhotonSamples, NO_DETECTION
+import numpy as np
 
-
-Tensor3DInt = List[List[List[int]]]
-Tensor2DInt = List[List[int]]
+from .first_photon import FirstPhotonAggregate
 
 
 @dataclass(frozen=True)
 class EquiWidthHistogram:
-    """Accumulated EWH counts.
+    """首光子 EWH 计数与未探测计数。
 
-    ``counts_hwt`` has shape ``[H, W, T]`` and units of detected first-photon
-    events per bin across ``num_laser_periods``. For every pixel, histogram
-    counts plus ``no_detection_counts_hw`` equals the number of periods.
+    ``counts_hwt`` 的 shape 为 ``[H, W, T]``。对每个像素，其计数总和加
+    ``no_detection_counts_hw`` 必须等于 ``num_laser_periods``。
     """
 
-    counts_hwt: Tensor3DInt
-    no_detection_counts_hw: Tensor2DInt
+    counts_hwt: np.ndarray
+    no_detection_counts_hw: np.ndarray
     num_laser_periods: int
     num_time_bins: int
 
+    @property
+    def detected_counts_hw(self):
+        return np.sum(self.counts_hwt, axis=-1, dtype=np.int64)
 
-def accumulate_ewh(samples, num_time_bins):
-    """Accumulate one bin at most per laser period into an EWH."""
 
-    if not isinstance(samples, FirstPhotonSamples):
-        raise TypeError("samples must be FirstPhotonSamples")
-    if not isinstance(num_time_bins, int) or num_time_bins <= 0:
-        raise ValueError("num_time_bins must be a positive integer")
+def accumulate_ewh(aggregate):
+    """校验聚合首光子计数，并将其封装为 EWH。"""
 
-    histogram = []
-    no_detection_counts = []
-    for row in samples.bin_indices_hwp:
-        histogram_row = []
-        no_detection_row = []
-        for periods in row:
-            if len(periods) != samples.num_laser_periods:
-                raise ValueError("event tensor period axis is inconsistent")
-            counts = [0] * num_time_bins
-            no_detection = 0
-            for index in periods:
-                if index == NO_DETECTION:
-                    no_detection += 1
-                elif 0 <= index < num_time_bins:
-                    counts[index] += 1
-                else:
-                    raise ValueError("first-photon bin index is outside the EWH")
-            if sum(counts) + no_detection != samples.num_laser_periods:
-                raise AssertionError("each period must produce exactly one outcome")
-            histogram_row.append(counts)
-            no_detection_row.append(no_detection)
-        histogram.append(histogram_row)
-        no_detection_counts.append(no_detection_row)
+    if not isinstance(aggregate, FirstPhotonAggregate):
+        raise TypeError("aggregate must be FirstPhotonAggregate")
+    counts = np.asarray(aggregate.counts_hwt)
+    no_detection = np.asarray(aggregate.no_detection_counts_hw)
+    if counts.ndim != 3:
+        raise ValueError("counts_hwt must have shape [H, W, T]")
+    if no_detection.shape != counts.shape[:2]:
+        raise ValueError("no_detection_counts_hw must have shape [H, W]")
+    if np.any(counts < 0) or np.any(no_detection < 0):
+        raise ValueError("EWH counts cannot be negative")
+    totals = np.sum(counts, axis=-1, dtype=np.int64) + no_detection.astype(np.int64)
+    if not np.all(totals == aggregate.num_laser_periods):
+        raise AssertionError("each pixel must have exactly one outcome per laser period")
 
     return EquiWidthHistogram(
-        counts_hwt=histogram,
-        no_detection_counts_hw=no_detection_counts,
-        num_laser_periods=samples.num_laser_periods,
-        num_time_bins=num_time_bins,
+        counts_hwt=np.ascontiguousarray(counts, dtype=np.int32),
+        no_detection_counts_hw=np.ascontiguousarray(no_detection, dtype=np.int32),
+        num_laser_periods=aggregate.num_laser_periods,
+        num_time_bins=counts.shape[-1],
     )
-

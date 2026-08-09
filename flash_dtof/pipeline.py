@@ -1,102 +1,79 @@
-"""End-to-end orchestration and diagnostics for the fixed MVP chain."""
+"""端到端完整阵列首光子 Flash dToF 链路。"""
 
 from dataclasses import dataclass
-import math
-from typing import List, Optional
 
-from .config import DerivedConfig, UserConfig, derive_config
+import numpy as np
+
+from .config import DerivedConfig, SceneInputs, SensorConfig, derive_config
 from .ewh import EquiWidthHistogram, accumulate_ewh
-from .first_photon import FirstPhotonSamples, sample_first_photons
+from .first_photon import sample_first_photon_counts
 from .reconstruction import MaximumBinReconstruction, reconstruct_maximum_bin
 from .transient import IdealTransient, generate_ideal_transient
 
 
 @dataclass(frozen=True)
-class PixelDiagnostics:
-    """Diagnostics for one pixel; bin shifts are observed minus ideal."""
+class ArrayDiagnostics:
+    """逐像素诊断图，所有数组的 shape 均为 ``[H, W]``。"""
 
-    row: int
-    column: int
-    ideal_peak_bin: int
-    observed_peak_bin: Optional[int]
-    peak_shift_bins: Optional[int]
-    detected_periods: int
-    no_detection_periods: int
-    measured_detection_fraction: float
-    expected_detection_fraction: float
-    estimated_distance_m: Optional[float]
-    distance_bias_m: Optional[float]
+    ideal_peak_bin_hw: np.ndarray
+    observed_peak_bin_hw: np.ndarray
+    peak_shift_bins_hw: np.ndarray
+    measured_detection_fraction_hw: np.ndarray
+    expected_detection_fraction_hw: np.ndarray
+    distance_bias_m_hw: np.ndarray
 
 
 @dataclass(frozen=True)
 class SimulationResult:
-    user_config: UserConfig
+    sensor_config: SensorConfig
     derived_config: DerivedConfig
+    scene_inputs: SceneInputs
     ideal_transient: IdealTransient
-    first_photon_samples: FirstPhotonSamples
     ewh: EquiWidthHistogram
     reconstruction: MaximumBinReconstruction
-    diagnostics: List[PixelDiagnostics]
+    diagnostics: ArrayDiagnostics
 
 
-def _argmax(values):
-    return max(range(len(values)), key=values.__getitem__)
+def run_simulation(sensor_config, scene_inputs):
+    """运行固定阵列链路，不加入校正或额外传感器效应。"""
 
-
-def run_simulation(user_config):
-    """Run the fixed MVP chain without correction or extra sensor effects."""
-
-    derived = derive_config(user_config)
-    transient = generate_ideal_transient(user_config, derived)
-    samples = sample_first_photons(
-        transient,
-        user_config.num_laser_periods,
-        user_config.random_seed,
+    derived = derive_config(sensor_config)
+    transient = generate_ideal_transient(sensor_config, derived, scene_inputs)
+    aggregate = sample_first_photon_counts(
+        transient.expected_photons_hwt,
+        sensor_config.num_laser_periods,
+        sensor_config.random_seed,
     )
-    histogram = accumulate_ewh(samples, user_config.num_time_bins)
-    reconstruction = reconstruct_maximum_bin(histogram, user_config.bin_width_s)
+    histogram = accumulate_ewh(aggregate)
+    reconstruction = reconstruct_maximum_bin(histogram, sensor_config.bin_width_s)
 
-    diagnostics = []
-    for row_index in range(user_config.image_height):
-        for column_index in range(user_config.image_width):
-            ideal_profile = transient.expected_photons_hwt[row_index][column_index]
-            ideal_peak = _argmax(ideal_profile)
-            observed_peak = reconstruction.peak_bin_hw[row_index][column_index]
-            no_detection = histogram.no_detection_counts_hw[row_index][column_index]
-            detected = user_config.num_laser_periods - no_detection
-            total_expected = sum(ideal_profile)
-            estimated_distance = reconstruction.estimated_distance_m_hw[row_index][
-                column_index
-            ]
-            diagnostics.append(
-                PixelDiagnostics(
-                    row=row_index,
-                    column=column_index,
-                    ideal_peak_bin=ideal_peak,
-                    observed_peak_bin=observed_peak,
-                    peak_shift_bins=(
-                        None if observed_peak is None else observed_peak - ideal_peak
-                    ),
-                    detected_periods=detected,
-                    no_detection_periods=no_detection,
-                    measured_detection_fraction=(
-                        float(detected) / user_config.num_laser_periods
-                    ),
-                    expected_detection_fraction=-math.expm1(-total_expected),
-                    estimated_distance_m=estimated_distance,
-                    distance_bias_m=(
-                        None
-                        if estimated_distance is None
-                        else estimated_distance - user_config.distance_m
-                    ),
-                )
-            )
+    ideal_peak = np.argmax(transient.expected_photons_hwt, axis=-1).astype(np.int16)
+    measured_detection = (
+        histogram.detected_counts_hw.astype(np.float64)
+        / sensor_config.num_laser_periods
+    ).astype(np.float32)
+    total_expected = np.sum(transient.expected_photons_hwt, axis=-1, dtype=np.float64)
+    expected_detection = (-np.expm1(-total_expected)).astype(np.float32)
+    peak_shift = np.full(ideal_peak.shape, np.nan, dtype=np.float32)
+    peak_shift[reconstruction.valid_hw] = (
+        reconstruction.peak_bin_hw[reconstruction.valid_hw]
+        - ideal_peak[reconstruction.valid_hw]
+    )
+    distance_bias = reconstruction.estimated_distance_m_hw - scene_inputs.depth_m
 
+    diagnostics = ArrayDiagnostics(
+        ideal_peak_bin_hw=ideal_peak,
+        observed_peak_bin_hw=reconstruction.peak_bin_hw,
+        peak_shift_bins_hw=peak_shift,
+        measured_detection_fraction_hw=measured_detection,
+        expected_detection_fraction_hw=expected_detection,
+        distance_bias_m_hw=distance_bias.astype(np.float32),
+    )
     return SimulationResult(
-        user_config=user_config,
+        sensor_config=sensor_config,
         derived_config=derived,
+        scene_inputs=scene_inputs,
         ideal_transient=transient,
-        first_photon_samples=samples,
         ewh=histogram,
         reconstruction=reconstruction,
         diagnostics=diagnostics,
@@ -104,48 +81,58 @@ def run_simulation(user_config):
 
 
 def format_diagnostics(result):
-    """Format reproducibility, flux, detection, pile-up, and range diagnostics."""
+    """返回简洁的完整阵列通量、探测、pile-up 与距离汇总。"""
 
-    lines = [
-        "SIMULATION DIAGNOSTICS",
-        "  seed                         : {}".format(result.user_config.random_seed),
-        "  model                        : first photon per pixel per laser period",
-        "  signal / background flux     : {:.6g} / {:.6g} detected photons per pulse".format(
-            result.derived_config.effective_signal_photons_per_pulse,
-            result.derived_config.expected_background_photons_per_pulse,
-        ),
-    ]
-    for diagnostic in result.diagnostics:
-        distance = (
-            "none"
-            if diagnostic.estimated_distance_m is None
-            else "{:.6f} m".format(diagnostic.estimated_distance_m)
+    valid = result.reconstruction.valid_hw
+    diagnostics = result.diagnostics
+    centre = (
+        result.sensor_config.image_height // 2,
+        result.sensor_config.image_width // 2,
+    )
+    valid_fraction = float(np.mean(valid))
+    if np.any(valid):
+        bias = diagnostics.distance_bias_m_hw[valid]
+        shift = diagnostics.peak_shift_bins_hw[valid]
+        bias_mean = float(np.mean(bias))
+        rmse = float(np.sqrt(np.mean(bias.astype(np.float64) ** 2)))
+        shift_summary = "mean={:+.3f}, min={:+.0f}, max={:+.0f}".format(
+            float(np.mean(shift)), float(np.min(shift)), float(np.max(shift))
         )
-        bias = (
-            "none"
-            if diagnostic.distance_bias_m is None
-            else "{:+.6f} m".format(diagnostic.distance_bias_m)
-        )
-        lines.extend(
-            [
-                "  pixel [{},{}]".format(diagnostic.row, diagnostic.column),
-                "    detections / periods       : {} / {}".format(
-                    diagnostic.detected_periods,
-                    result.user_config.num_laser_periods,
-                ),
-                "    detection fraction meas/exp: {:.6f} / {:.6f}".format(
-                    diagnostic.measured_detection_fraction,
-                    diagnostic.expected_detection_fraction,
-                ),
-                "    ideal / observed peak bin  : {} / {}".format(
-                    diagnostic.ideal_peak_bin,
-                    diagnostic.observed_peak_bin,
-                ),
-                "    observed - ideal shift     : {} bins".format(
-                    diagnostic.peak_shift_bins
-                ),
-                "    max-bin distance / bias    : {} / {}".format(distance, bias),
-            ]
-        )
-    return "\n".join(lines)
+    else:
+        bias_mean = float("nan")
+        rmse = float("nan")
+        shift_summary = "no valid pixels"
 
+    return "\n".join(
+        [
+            "FULL-ARRAY SIMULATION DIAGNOSTICS",
+            "  model                        : earliest photon per pixel per period",
+            "  EWH shape                    : {}".format(result.ewh.counts_hwt.shape),
+            "  EWH dtype / memory           : {} / {:.2f} MiB".format(
+                result.ewh.counts_hwt.dtype,
+                result.ewh.counts_hwt.nbytes / (1024.0 ** 2),
+            ),
+            "  valid pixel fraction         : {:.6f}".format(valid_fraction),
+            "  detection fraction mean      : {:.6f} (expected {:.6f})".format(
+                float(np.mean(diagnostics.measured_detection_fraction_hw)),
+                float(np.mean(diagnostics.expected_detection_fraction_hw)),
+            ),
+            "  peak shift bins               : {}".format(shift_summary),
+            "  distance bias mean / RMSE    : {:+.6f} / {:.6f} m".format(
+                bias_mean, rmse
+            ),
+            "  centre pixel [r,c]           : {}".format(centre),
+            "    true / estimated distance   : {:.6f} / {:.6f} m".format(
+                float(result.scene_inputs.depth_m[centre]),
+                float(result.reconstruction.estimated_distance_m_hw[centre]),
+            ),
+            "    ideal / observed peak bin   : {} / {}".format(
+                int(diagnostics.ideal_peak_bin_hw[centre]),
+                int(diagnostics.observed_peak_bin_hw[centre]),
+            ),
+            "    detected / no-detection     : {} / {}".format(
+                int(result.ewh.detected_counts_hw[centre]),
+                int(result.ewh.no_detection_counts_hw[centre]),
+            ),
+        ]
+    )

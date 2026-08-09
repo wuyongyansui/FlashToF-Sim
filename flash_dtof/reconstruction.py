@@ -1,70 +1,60 @@
-"""MVP reconstruction: maximum-bin direct time-of-flight ranging only."""
+"""仅实现向量化最大 bin 直接飞行时间重建。"""
 
 from dataclasses import dataclass
-from typing import List, Optional
+
+import numpy as np
 
 from .config import SPEED_OF_LIGHT_M_PER_S
 from .ewh import EquiWidthHistogram
 
 
-Tensor2DOptionalInt = List[List[Optional[int]]]
-Tensor2DOptionalFloat = List[List[Optional[float]]]
-
-
 @dataclass(frozen=True)
 class MaximumBinReconstruction:
-    """Maximum-count bins and range estimates, both with shape ``[H, W]``."""
+    """最大计数 bin 图和距离图，二者 shape 均为 ``[H, W]``。"""
 
-    peak_bin_hw: Tensor2DOptionalInt
-    estimated_distance_m_hw: Tensor2DOptionalFloat
+    peak_bin_hw: np.ndarray
+    estimated_distance_m_hw: np.ndarray
+    valid_hw: np.ndarray
 
 
 def bin_center_time_s(bin_index, bin_width_s):
-    """Convert a zero-based EWH index to its time-bin center in seconds."""
+    """将零基 EWH 索引转换为以秒计的时间 bin 中心。"""
 
-    if not isinstance(bin_index, int) or bin_index < 0:
-        raise ValueError("bin_index must be a nonnegative integer")
-    if bin_width_s <= 0.0:
-        raise ValueError("bin_width_s must be > 0")
-    return (bin_index + 0.5) * bin_width_s
+    indices = np.asarray(bin_index)
+    if np.any(indices < 0) or bin_width_s <= 0.0:
+        raise ValueError("bin indices must be >= 0 and bin_width_s must be > 0")
+    return (indices + 0.5) * bin_width_s
 
 
 def round_trip_time_to_distance_m(round_trip_time_s):
-    """Convert round-trip time in seconds to one-way range in metres."""
+    """将秒制往返时间转换为米制单程距离。"""
 
-    if round_trip_time_s < 0.0:
+    times = np.asarray(round_trip_time_s)
+    if np.any(times < 0.0):
         raise ValueError("round_trip_time_s must be >= 0")
-    return SPEED_OF_LIGHT_M_PER_S * round_trip_time_s / 2.0
+    return SPEED_OF_LIGHT_M_PER_S * times / 2.0
 
 
 def reconstruct_maximum_bin(histogram, bin_width_s):
-    """Estimate each pixel's distance from the earliest maximum-count bin."""
+    """使用 ``argmax(axis=-1)`` 估计完整阵列距离图。"""
 
     if not isinstance(histogram, EquiWidthHistogram):
         raise TypeError("histogram must be EquiWidthHistogram")
+    if bin_width_s <= 0.0:
+        raise ValueError("bin_width_s must be > 0")
 
-    peaks = []
-    distances = []
-    for row in histogram.counts_hwt:
-        peak_row = []
-        distance_row = []
-        for counts in row:
-            if len(counts) != histogram.num_time_bins:
-                raise ValueError("histogram time axis is inconsistent")
-            if sum(counts) == 0:
-                peak_row.append(None)
-                distance_row.append(None)
-                continue
-            peak = max(range(histogram.num_time_bins), key=counts.__getitem__)
-            peak_row.append(peak)
-            distance_row.append(
-                round_trip_time_to_distance_m(bin_center_time_s(peak, bin_width_s))
-            )
-        peaks.append(peak_row)
-        distances.append(distance_row)
+    detected = histogram.detected_counts_hw > 0
+    peak = np.argmax(histogram.counts_hwt, axis=-1).astype(np.int16)
+    distances = np.full(peak.shape, np.nan, dtype=np.float32)
+    distances[detected] = (
+        SPEED_OF_LIGHT_M_PER_S
+        * ((peak[detected].astype(np.float64) + 0.5) * bin_width_s)
+        / 2.0
+    ).astype(np.float32)
+    peak = np.where(detected, peak, -1).astype(np.int16)
 
     return MaximumBinReconstruction(
-        peak_bin_hw=peaks,
+        peak_bin_hw=peak,
         estimated_distance_m_hw=distances,
+        valid_hw=np.ascontiguousarray(detected),
     )
-

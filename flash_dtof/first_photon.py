@@ -1,95 +1,86 @@
-"""Per-laser-period first-photon SPAD acquisition."""
+"""面向完整 SPAD 阵列的内存安全首光子聚合。"""
 
-from bisect import bisect_left
 from dataclasses import dataclass
-import math
-import random
-from typing import List
 
-from .transient import IdealTransient
-
-
-NO_DETECTION = -1
-Tensor3DInt = List[List[List[int]]]
+import numpy as np
 
 
 @dataclass(frozen=True)
-class FirstPhotonSamples:
-    """One outcome for every pixel and laser period.
+class FirstPhotonAggregate:
+    """不创建 ``[H, W, P]`` 张量的首光子聚合结果。"""
 
-    ``bin_indices_hwp`` has shape ``[H, W, P]``. Each value is the earliest
-    detected time-bin index in that laser period, or ``NO_DETECTION``. It is
-    therefore impossible for a period to contribute to multiple EWH bins.
-    """
-
-    bin_indices_hwp: Tensor3DInt
+    counts_hwt: np.ndarray
+    no_detection_counts_hw: np.ndarray
     num_laser_periods: int
     random_seed: int
 
 
-def first_photon_probabilities(expected_photons_per_bin):
-    """Return exact first-detection probabilities for independent Poisson bins.
+def first_photon_probabilities(expected_photons_hwt):
+    """返回首个探测 bin 与未探测事件的解析概率。
 
-    For expected counts ``lambda[k]`` per period,
+    对速率为 ``lambda[k]`` 的独立 Poisson bin：
 
     ``P(K=k) = exp(-sum(lambda[:k])) * (1 - exp(-lambda[k]))``.
-
-    The second return value is the probability of no detection in the complete
-    timing window. This is the first-photon pile-up forward model, not an
-    independent count draw for every bin.
     """
 
-    probabilities = []
-    survival = 1.0
-    for index, expected in enumerate(expected_photons_per_bin):
-        if not math.isfinite(expected) or expected < 0.0:
-            raise ValueError(
-                "expected photon count at bin {} must be finite and >= 0".format(index)
-            )
-        detection_in_bin = -math.expm1(-expected)
-        probabilities.append(survival * detection_in_bin)
-        survival *= math.exp(-expected)
-    return probabilities, survival
+    expected = _validate_expected_photons(expected_photons_hwt)
+    cumulative_inclusive = np.cumsum(expected, axis=-1, dtype=np.float64)
+    cumulative_exclusive = cumulative_inclusive - expected
+    conditional_detection = -np.expm1(-expected)
+    probabilities = np.exp(-cumulative_exclusive) * conditional_detection
+    no_detection = np.exp(-cumulative_inclusive[..., -1])
+    return probabilities, no_detection
 
 
-def _probability_cdf(expected_photons_per_bin):
-    probabilities, no_detection_probability = first_photon_probabilities(
-        expected_photons_per_bin
-    )
-    cdf = []
-    running = 0.0
-    for probability in probabilities:
-        running += probability
-        cdf.append(running)
-    return cdf, no_detection_probability
+def sample_first_photon_counts(expected_photons_hwt, num_laser_periods, random_seed):
+    """使用条件二项分布精确采样聚合首光子 EWH。
 
+    ``remaining`` 是未在更早 bin 探测、因而到达当前 bin 的激光周期数。
+    执行抽样
 
-def sample_first_photons(transient, num_laser_periods, random_seed):
-    """Sample exactly one earliest detection (or none) per pixel and period."""
+    ``counts[k] ~ Binomial(remaining, 1-exp(-lambda[k]))``
 
-    if not isinstance(transient, IdealTransient):
-        raise TypeError("transient must be IdealTransient")
-    if not isinstance(num_laser_periods, int) or num_laser_periods <= 0:
-        raise ValueError("num_laser_periods must be a positive integer")
-    if not isinstance(random_seed, int):
+    并扣除这些探测，与逐周期独立仿真并在最早光子处停止的统计分布完全
+    等价。内存复杂度为 ``O(H*W*T)``，不包含脉冲维度。
+    """
+
+    expected = _validate_expected_photons(expected_photons_hwt)
+    if not isinstance(num_laser_periods, int) or isinstance(num_laser_periods, bool):
+        raise ValueError("num_laser_periods must be an integer")
+    if num_laser_periods <= 0 or num_laser_periods > np.iinfo(np.int32).max:
+        raise ValueError("num_laser_periods must be in the positive int32 range")
+    if not isinstance(random_seed, int) or isinstance(random_seed, bool):
         raise ValueError("random_seed must be an integer")
 
-    generator = random.Random(random_seed)
-    all_pixels = []
-    for row in transient.expected_photons_hwt:
-        sampled_row = []
-        for expected_profile in row:
-            cdf, _ = _probability_cdf(expected_profile)
-            num_bins = len(cdf)
-            periods = []
-            for _ in range(num_laser_periods):
-                index = bisect_left(cdf, generator.random())
-                periods.append(index if index < num_bins else NO_DETECTION)
-            sampled_row.append(periods)
-        all_pixels.append(sampled_row)
+    height, width, num_bins = expected.shape
+    generator = np.random.default_rng(random_seed)
+    remaining = np.full((height, width), num_laser_periods, dtype=np.int64)
+    counts = np.zeros((height, width, num_bins), dtype=np.int32)
 
-    return FirstPhotonSamples(
-        bin_indices_hwp=all_pixels,
+    for index in range(num_bins):
+        if not np.any(remaining):
+            break
+        conditional_probability = np.clip(
+            -np.expm1(-expected[..., index]), 0.0, 1.0
+        )
+        detected = generator.binomial(remaining, conditional_probability)
+        counts[..., index] = detected.astype(np.int32)
+        remaining -= detected
+
+    return FirstPhotonAggregate(
+        counts_hwt=counts,
+        no_detection_counts_hw=remaining.astype(np.int32),
         num_laser_periods=num_laser_periods,
         random_seed=random_seed,
     )
+
+
+def _validate_expected_photons(expected_photons_hwt):
+    expected = np.asarray(expected_photons_hwt)
+    if expected.ndim != 3 or expected.shape[-1] <= 0:
+        raise ValueError("expected_photons_hwt must have shape [H, W, T]")
+    if not np.issubdtype(expected.dtype, np.floating):
+        expected = expected.astype(np.float32)
+    if not np.all(np.isfinite(expected)) or np.any(expected < 0.0):
+        raise ValueError("expected photon rates must be finite and >= 0")
+    return expected
