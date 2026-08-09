@@ -1,54 +1,47 @@
 import math
 import unittest
 
-from flash_dtof.config import UserConfig, derive_config
+import numpy as np
+
 from flash_dtof.ewh import accumulate_ewh
 from flash_dtof.first_photon import (
-    NO_DETECTION,
     first_photon_probabilities,
-    sample_first_photons,
+    sample_first_photon_counts,
 )
-from flash_dtof.transient import generate_ideal_transient
 
 
 class FirstPhotonAndEwhTests(unittest.TestCase):
     def test_analytic_first_photon_distribution(self):
-        probabilities, no_detection = first_photon_probabilities([0.2, 0.3])
-        self.assertAlmostEqual(probabilities[0], 1.0 - math.exp(-0.2))
+        rates = np.array([[[0.2, 0.3]]], dtype=np.float32)
+        probabilities, no_detection = first_photon_probabilities(rates)
+        self.assertAlmostEqual(probabilities[0, 0, 0], 1.0 - math.exp(-0.2), places=7)
         self.assertAlmostEqual(
-            probabilities[1], math.exp(-0.2) * (1.0 - math.exp(-0.3))
+            probabilities[0, 0, 1],
+            math.exp(-0.2) * (1.0 - math.exp(-0.3)),
+            places=7,
         )
-        self.assertAlmostEqual(no_detection, math.exp(-0.5))
-        self.assertAlmostEqual(sum(probabilities) + no_detection, 1.0)
-
-    def test_seed_is_reproducible_and_each_period_has_one_outcome(self):
-        config = UserConfig(
-            num_time_bins=64,
-            bin_width_s=500e-12,
-            num_laser_periods=500,
-            distance_m=2.0,
-            signal_photons_per_pulse_at_reference=1.0,
-            reference_distance_m=2.0,
-            background_photons_per_bin=1e-3,
-            pulse_fwhm_s=1e-9,
-            random_seed=99,
-        )
-        transient = generate_ideal_transient(config, derive_config(config))
-        first = sample_first_photons(transient, 500, 99)
-        second = sample_first_photons(transient, 500, 99)
-        self.assertEqual(first, second)
-        events = first.bin_indices_hwp[0][0]
-        self.assertEqual(len(events), 500)
-        self.assertTrue(
-            all(event == NO_DETECTION or 0 <= event < config.num_time_bins for event in events)
+        self.assertAlmostEqual(no_detection[0, 0], math.exp(-0.5), places=7)
+        self.assertAlmostEqual(
+            float(np.sum(probabilities[0, 0]) + no_detection[0, 0]), 1.0, places=7
         )
 
-        histogram = accumulate_ewh(first, config.num_time_bins)
-        counts = histogram.counts_hwt[0][0]
-        no_detection = histogram.no_detection_counts_hw[0][0]
-        self.assertEqual(sum(counts) + no_detection, 500)
+    def test_seed_reproducibility_and_pixelwise_period_conservation(self):
+        # 10,000 是统计单元测试参数，不是用户默认值。
+        rates = np.zeros((4, 5, 12), dtype=np.float32)
+        rates[..., 3:7] = np.array([0.1, 0.3, 0.2, 0.05], dtype=np.float32)
+        first = sample_first_photon_counts(rates, 10_000, 99)
+        second = sample_first_photon_counts(rates, 10_000, 99)
+        np.testing.assert_array_equal(first.counts_hwt, second.counts_hwt)
+        np.testing.assert_array_equal(
+            first.no_detection_counts_hw, second.no_detection_counts_hw
+        )
+
+        histogram = accumulate_ewh(first)
+        totals = histogram.detected_counts_hw + histogram.no_detection_counts_hw
+        np.testing.assert_array_equal(totals, np.full((4, 5), 10_000))
+        self.assertEqual(histogram.counts_hwt.shape, (4, 5, 12))
+        self.assertEqual(histogram.counts_hwt.dtype, np.int32)
 
 
 if __name__ == "__main__":
     unittest.main()
-

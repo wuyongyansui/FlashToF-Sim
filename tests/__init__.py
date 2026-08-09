@@ -1,2 +1,1 @@
-"""Tests for the minimal Flash dToF simulator."""
-
+"""最小 Flash dToF 仿真器测试。"""
