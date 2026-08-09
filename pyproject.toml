@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-dtof-simulator"
+version = "0.1.0"
+description = "Minimal first-photon Flash dToF simulator with equi-width histograms"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{name = "Flash dToF simulator contributors"}]
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["flash_dtof*"]
