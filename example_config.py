@@ -1,38 +1,62 @@
-"""用户可编辑的传感器参数与正式 NYU 批量数据配置。"""
+"""用户可编辑的 NYU 几何、STB 时间传感器、数据选择与输出配置。"""
 
 from pathlib import Path
 
 from flash_dtof.batch import NYUBatchConfig
-from flash_dtof.config import SensorConfig
+from flash_dtof.config import CameraGeometryConfig, SensorConfig
+from flash_dtof.output import OutputConfig
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
-# 用户可调：传感器与采集参数
+# 用户可调：NYU RGB 相机几何
+# ---------------------------------------------------------------------------
+CAMERA_CONFIG = CameraGeometryConfig(
+    # NYU Depth V2 Toolbox 的标定脚本路径；程序只读解析其中 fx_rgb、fy_rgb、
+    # cx_rgb、cy_rgb，不执行 MATLAB，不读取 depth K，也不应用 RGB-depth 外参。
+    camera_params_path=WORKSPACE_ROOT / "toolbox_nyu_depth_v2" / "camera_params.m",
+    # 标定对应的 RGB 图像尺寸 [W,H]（像素）；必须与传感器和轻量 NYU 数据
+    # 的原生 640×480 网格一致，不裁剪、不缩放、不重投影。
+    calibrated_image_size_wh=(640, 480),
+    # 输入深度固定解释为 RGB 光轴方向轴向深度 z（米），不是斜距。
+    # 程序按单位 RGB 射线计算真实斜距 range=z/d_z；当前只支持此语义。
+    depth_semantics="rgb_optical_axis_z",
+)
+
+
+# ---------------------------------------------------------------------------
+# 用户可调：STB 一致的时间传感器、通量与响应
 # ---------------------------------------------------------------------------
 SENSOR_CONFIG = SensorConfig(
-    # SPAD 阵列行数 H（像素）；输出深度图、诊断图的高度。
-    image_height=120,
-    # SPAD 阵列列数 W（像素）；输出深度图、诊断图的宽度。
-    image_width=240,
-    # 等宽时间直方图的 bin 数 T（个）；总时间窗=T*bin_width_s。
-    num_time_bins=190,
-    # 单个时间 bin 的宽度（秒）；0.5e-9 s = 0.5 ns。
-    # 单程距离分辨间隔约为 c*bin_width_s/2，此处约 0.074948 m。
-    bin_width_s=0.5e-9,
-    # 每个像素累计的激光发射周期数（次）；每周期最多保留一个最早光子。
+    # SPAD 阵列行数 H（像素）；480 与 NYU 原生 RGB/深度高度一致。
+    image_height=480,
+    # SPAD 阵列列数 W（像素）；640 与 NYU 原生 RGB/深度宽度一致。
+    image_width=640,
+    # EWH 等宽时间 bin 数 T（个）；STB 时间轴配置为 672 个 bin。
+    num_time_bins=672,
+    # 单 bin 宽度（秒）；0.75e-9 s=0.75 ns，与实测 IRF 的 750 ps 采样一致。
+    # 单程斜距 bin 间隔约 c*0.75 ns/2=0.112422 m。
+    bin_width_s=0.75e-9,
+    # 每像素累计的激光发射周期数（次）；每周期只保留最早探测光子。
     num_laser_periods=20_000,
-    # 高斯系统脉冲的半高全宽 FWHM（秒）；描述时间响应展宽，不是周期长度。
+    # 默认时间响应模式。"measured_irf" 使用下方实测模板；"gaussian" 只用于
+    # 显式后备或受控测试，不是正式默认模型。
+    transient_model="measured_irf",
+    # SP-TransientBench IRF 文件路径。文件虽为 .txt 后缀，内容必须是逗号
+    # 分隔的 t_ps,irf,irf_std；程序只读、将微小负残留 clip 到 0 后归一化。
+    measured_irf_path=WORKSPACE_ROOT / "config_IRF_global.txt",
+    # 仅在 transient_model="gaussian" 时生效的高斯 FWHM（秒）。
     pulse_fwhm_s=1.0e-9,
-    # 在 reference_distance_m、参考反射率=1.0 时，每像素每激光周期
-    # 期望探测到的信号光子数（photons/pixel/period）；已包含光学损耗和 PDE。
-    # 当前模型的“参考反射率”固定归一化为 1.0，不是另一个配置字段。
+    # 在 reference_distance_m、反射率 1.0 时，每像素每周期的期望信号
+    # 探测光子数；已包含光学损耗和 PDE。
     signal_photons_per_pulse_at_reference=0.05,
-    # 上述参考信号光子数对应的单程参考距离（米）；其他距离按 1/r^2 缩放。
+    # 参考信号对应的真实斜距（米）；其他像素按斜距的 1/r² 缩放。
     reference_distance_m=2.5,
-    # 每像素、每时间 bin、每激光周期的期望探测背景光子数
-    # （photons/pixel/bin/period）；当前基线在所有 bin 上均匀加入背景。
+    # 每像素、每时间 bin、每周期的均匀背景期望探测光子数。
     background_photons_per_bin=1e-5,
-    # 非负随机种子；固定后可复现实验。批量运行会据此为各场景派生稳定种子。
+    # 非负随机种子；固定后可复现。批量入口为各场景派生稳定种子。
     random_seed=20260809,
 )
 
@@ -40,28 +64,43 @@ SENSOR_CONFIG = SensorConfig(
 # ---------------------------------------------------------------------------
 # 用户可调：正式 NYU split 数据源与选择范围
 # ---------------------------------------------------------------------------
-# 正式路径不配置 sample_id；单张调试请使用 debug_single_scene.py。
-# 所有场景都按 load -> simulate -> summarize -> release 逐张处理，不整批驻留内存。
+# 正式配置不含 sample_id；单张调试使用 debug_single_scene.py。
+# 所有场景按 load -> geometry -> simulate -> summarize -> release 逐张处理。
 NYU_BATCH_CONFIG = NYUBatchConfig(
-    # NYU 轻量 RGB-D 数据根目录；程序只读 images/ 与 depth/，不移动或改写数据。
-    dataset_root=Path(__file__).resolve().parent.parent / "nyu-depth",
-    # 数据划分名称：只能是 "train" 或 "val"；会枚举该 split 中全部配对 ID。
+    # NYU 轻量 RGB-D 根目录；程序只读 images/ 与 depth/，不改写数据。
+    dataset_root=WORKSPACE_ROOT / "nyu-depth",
+    # 数据划分：只能是 "train" 或 "val"。
     split="val",
-    # 在按 sample ID 排序后的配对列表中，从第几个样本开始（零基索引）。
+    # 按 sample ID 排序后从第几个配对样本开始，零基索引。
     start=0,
-    # 最多处理的场景数；None 表示从 start 起处理该 split 的所有剩余场景。
-    # 开发时可临时设为较小正整数，正式全量评估应保持 None。
+    # 最多处理多少场景；None 表示从 start 起处理该 split 的全部剩余场景。
+    # 开发时可临时设为较小正整数，正式全量评估保持 None。
     limit=None,
-    # 反射率来源："constant" 为全像素常数；"luminance_proxy" 仅供明确的
-    # 合成实验。NYU JPG 是可见光 RGB，不应视为经过标定的 NIR 反射率。
+    # "constant" 为常数反射率；"luminance_proxy" 只用于明确的合成实验。
+    # NYU JPG 是可见光 RGB，不能当作经过标定的 NIR 反射率。
     reflectivity_mode="constant",
-    # 仅在 constant 模式下生效的无量纲相对反射率，范围 [0,1]。
-    # 0.5 表示每个像素采用参考反射率 1.0 的一半；因此在参考距离处，
-    # 当前默认期望信号为 0.05*0.5=0.025 photons/pixel/period。
+    # 仅 constant 模式生效，范围 [0,1]。0.5 表示参考反射率 1.0 的一半。
     constant_reflectivity=0.5,
 )
 
-# NYU 几何适配语义（由 loader 固定执行，不是额外配置项）：
-# RGB 与米制深度先使用完全相同的中心裁剪以匹配 240:120=2:1 的目标宽高比；
-# 对 640x480 源图即裁剪 [left,top,right,bottom]=[0,80,640,400] 得 640x320。
-# 随后 RGB 用双线性缩放至 240x120；深度用最近邻缩放，避免跨物体边界混合距离。
+
+# ---------------------------------------------------------------------------
+# 用户可调：仿真结果输出位置与实验名称
+# ---------------------------------------------------------------------------
+OUTPUT_CONFIG = OutputConfig(
+    # 所有运行目录的父目录；程序拒绝把结果写进 NYU 数据集目录。
+    output_root=Path(__file__).resolve().parent / "outputs",
+    # 实验名称。批量与单场景目录会在其后追加模式和样本信息。
+    run_name="nyu_geometry_stb_timing_baseline",
+    # 同名策略："increment" 追加 __002 等后缀；"error" 直接报错。
+    # 两种策略都不会覆盖已有结果。
+    existing_run_policy="increment",
+    # 单场景调试是否保存完整 int32 EWH。480×640×672 单文件约 787.50 MiB
+    # （825.75 MB）；True 保存，False 跳过。正式批量始终不保存逐场景大数组。
+    save_debug_ewh=True,
+)
+
+
+# 固定几何约定：轻量 NPY 已与 RGB 像素对齐，所以不使用 depth K 或 R,t
+# 重新投影。Toolbox 的 MATLAB 一基像素坐标用于生成单位 RGB 射线；输入
+# depth_z_m 是 RGB 光轴 z，ToF 和 inverse-square 衰减均使用 z/d_z 斜距。

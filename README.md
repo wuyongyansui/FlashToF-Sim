@@ -1,223 +1,253 @@
-# 完整阵列 Flash dToF 首光子仿真器
+# Flash dToF 完整阵列首光子仿真基线
 
-这是一个独立 Python 项目，用于实现 Flash 直接飞行时间仿真平台的第一条
-可运行完整阵列链路。`SPCSimLib` 仅作为只读架构参考；本项目既不导入，
-也不修改它。
+这是一个独立的、可运行的 Python 项目。当前基线组合了两部分：
 
-版本 0.3 的固定逐场景链路为：
+- NYU Depth V2 原生 640×480 RGB 像素几何；
+- SP-TransientBench 一致的 672×0.75 ns 时间轴和实测全局 IRF。
+
+它实现固定单回波链路：轴向深度 `z` → RGB 单位像素射线 → 真实斜距
+`range=z/d_z` → 实测 IRF 理想到达率 → 每像素每激光周期仅保留最早光子
+→ 等宽时间直方图 EWH → 最大-bin 斜距重建。高通量下早到光子优先，因此
+pile-up 会由采集统计自然产生。
+
+本项目不修改、复制或依赖 SPCSImLib 的上游代码，也不会修改 NYU 数据、
+NYU Toolbox 或外部 IRF 文件。
+
+## 当前默认参数
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| 阵列 | 480×640 | 与原生 NYU RGB-D 像素一一对应 |
+| EWH bin 数 | 672 | STB 时间轴 |
+| bin 宽 | 0.75 ns | 与 IRF 的 750 ps 采样间隔一致 |
+| 时间窗 | 504 ns | `672×0.75 ns` |
+| 斜距 bin 间隔 | 0.112422 m | `c·bin_width/2` |
+| 最大无歧义斜距 | 75.547699 m | `c·time_window/2` |
+| 激光周期数 | 20,000 | 每像素、每周期最多记录一次最早探测 |
+| 瞬态响应 | `measured_irf` | 默认读取外部 STB IRF |
+| 场景回波 | 单回波 | 每像素一个轴向深度和一个反射率 |
+
+默认设置集中在 [example_config.py](./example_config.py)，每个用户可调参数都
+有中文注释。`SensorConfig` 是用户输入，`DerivedConfig` 中的时间窗、距离
+间隔、最大无歧义距离和 HWT 内存是只读派生值。
+
+## 相机几何与深度语义
+
+默认只读解析：
 
 ```text
-SensorConfig + SceneInputs(depth_m[H,W], reflectivity[H,W])
-  -> 空间理想瞬态 lambda[H,W,T]
-  -> 每像素、每激光周期的最早光子
-  -> 首光子等宽直方图 counts[H,W,T]
-  -> 最大 bin 距离图 [H,W]
-  -> 探测、未探测、峰位偏移与距离偏差图
+F:\Master\Job\lidar\toolbox_nyu_depth_v2\camera_params.m
 ```
 
-## 目标传感器规格
+从中取得经过本地验证的 RGB 针孔内参：
 
-用户可编辑的默认值对应首个完整阵列目标：
+```text
+fx = 518.85790117450188 px
+fy = 519.46961112127485 px
+cx = 325.58244941119034
+cy = 253.73616633400465
+K  = [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+```
 
-| 参数 | 默认值 |
-|---|---:|
-| SPAD 阵列 | 120 行 × 240 列 |
-| EWH bin 数 | 190 |
-| bin 宽 | 0.5 ns |
-| 激光周期数 | 20,000 |
-| 时间窗 | 95 ns |
-| 单 bin 单程距离 | 0.074948 m |
-| 最大无模糊距离 | 14.240142 m |
+射线生成遵循 Toolbox `rgb_plane2rgb_world.m`：像素坐标是 MATLAB 一基
+`u=1..640, v=1..480`，相机坐标采用 `+X` 向图像右、`+Y` 向图像上、
+`+Z` 沿 RGB 光轴向前。对每个像素先构造并归一化：
 
-95 ns 时间窗可以覆盖本地 NYU Depth V2 轻量数据约 0.71–9.99 m 的
-距离范围。
+```text
+q = [(u-cx)/fx, -(v-cy)/fy, 1]
+d = q / ||q||
+```
 
-## 安装与运行
+轻量 NYU 的 NPY 已经与 RGB 像素对齐，因此不再使用 depth 相机内参或
+RGB-depth 的 `R,t` 重投影。NPY 数值明确解释为 RGB 光轴方向的轴向深度
+`depth_z_m`，真实单程斜距为：
 
-已验证 Conda 环境为 `spcsimlib`，Python 版本 3.8.20。运行时依赖仅有 NumPy
-与 Pillow。
+```text
+slant_range_m = depth_z_m / d_z
+```
+
+ToF `2·range/c`、参考信号的 `1/r²` 缩放、重建真值与误差评估全部使用该
+斜距。调试输出会同时保存 `depth_z_m`、`d_z` 和 `slant_range_m`，不会再
+把轴向深度误标为斜距。
+
+当前未使用 RGB 畸变参数。这里假设轻量 NYU 的对齐 RGB-D 像素网格可直接
+配合 Toolbox 的 RGB 针孔内参；这一点是当前唯一仍需用数据来源文档或实测
+投影进一步确认的几何假设。
+
+## 实测 IRF
+
+默认只读文件：
+
+```text
+F:\Master\Job\lidar\config_IRF_global.txt
+```
+
+虽然扩展名是 `.txt`，内容必须是逗号分隔的：
+
+```text
+t_ps,irf,irf_std
+```
+
+加载器严格检查列名、有限数值、单调等间隔时间、唯一 0 ps 样本、0 ps 处
+峰值、非负 `irf_std` 以及采样间隔与传感器 bin 宽一致。当前文件有 501 个
+样本，间隔 750 ps，峰在索引 250 的 0 ps。
+
+原始 `irf` 中拟合产生的微小负残留在内存中 clip 到 0，再按离散样本和归一
+化；原文件不修改。模板是以峰为 0 的相对响应，不是 672-bin 的完整观测窗。
+生成场景瞬态时，将它平移到每个像素 ToF。源/目标步长相同时，非整数 bin
+位移通过相邻质量线性分配：模板完整落在记录窗内时总质量守恒，落出窗口的
+尾部自然截断且不重新归一化，峰前与峰后都保留。
+
+`transient_model="gaussian"` 仍可用于小测试或显式后备；正式默认值不是
+Gaussian。
+
+## 首光子采集语义
+
+理想到达率 `lambda[H,W,T]` 表示每周期、每 bin 的期望探测光子数。对每个
+像素，从 `remaining=P` 开始依次处理时间 bin：
+
+```text
+p_k = 1 - exp(-lambda_k)
+counts_k ~ Binomial(remaining, p_k)
+remaining -= counts_k
+```
+
+这与逐周期 Poisson 到达并在最早探测光子处停止严格同分布，但不创建
+`[H,W,P]` 张量。逐像素始终满足：
+
+```text
+sum_k(EWH_k) + no_detection = num_laser_periods
+```
+
+因此它不是“每个 bin 独立计数”。低通量下 EWH 接近理想到达率；高通量下
+晚 bin 可用周期被前面的探测消耗，峰自然前移。
+
+## NYU 流式批量入口
+
+环境与依赖：
 
 ```powershell
 conda activate spcsimlib
-cd F:\Master\Job\lidar\flash_dtof_simulator
+python -m pip install -e .
+```
 
-# 正式路径：流式处理配置 split 中的全部配对场景。
+正式 split 入口：
+
+```powershell
 python run_simulation.py
+python run_simulation.py --start 0 --limit 2
+```
 
-# 开发子集：仍然逐场景流式处理。
-python run_simulation.py --start 0 --limit 8
+`limit=None` 表示从 `start` 起处理整个 split。流程严格逐场景执行
+`load → geometry → simulate → summarize → release`，不把整个数据集放入
+内存，也不保存每个场景的大数组。
 
-# 显式单场景调试；不能作为正式 benchmark 路径。
+每次批量运行创建独立目录：
+
+```text
+outputs/<run_name>_batch/
+  config_snapshot.json
+  summary_metrics.json
+  scene_metrics.csv
+  run_status.json
+  RUN_README.txt
+```
+
+CSV 每场景一行；JSON 保存汇总指标。误差指标以真实斜距为真值。
+
+## 独立单场景调试入口
+
+单样本不混入正式批量配置：
+
+```powershell
 python debug_single_scene.py --split val --sample-id nyu_0000
-
-python -m unittest discover -s tests -v
 ```
 
-请只编辑 `example_config.py` 中明确标出的区域，以修改阵列尺寸、bin、
-周期数、脉冲宽度、通量、随机种子、数据根目录、split、样本选择范围或
-合成反射率模式。正式配置不包含 `sample_id`。
-
-## 配置与场景边界
-
-`SensorConfig` 保存用户设置的采集参数：
-
-- 阵列高度与宽度；
-- 等宽时间 bin 的数量与宽度；
-- 激光周期数与随机种子；
-- 高斯脉冲 FWHM；
-- 参考距离处的期望探测信号光子数；
-- 每 bin、每周期的期望探测背景光子数。
-
-`SceneInputs` 保存空间 float32 数组：
-
-| 物理量 | shape | 单位或含义 |
-|---|---:|---|
-| `depth_m` | `[H,W]` | 米制单程距离 |
-| `reflectivity` | `[H,W]` | `[0,1]` 范围的合成无量纲系数 |
-| 可选背景图 | `[H,W]` | 探测光子/bin/周期 |
-
-派生的时间、距离、脉冲 sigma 与 shape 参数均为只读。场景数组会依据
-传感器 shape 和最大无模糊距离进行校验。
-
-### 中文配置速查
-
-`example_config.py` 已在每个可调字段旁提供中文注释。关键含义如下：
-
-| 配置字段 | 单位/取值 | 物理意义 |
-|---|---|---|
-| `image_height` / `image_width` | 像素 | SPAD 阵列行数 H 与列数 W |
-| `num_time_bins` | 个 | EWH 等宽时间 bin 数 T |
-| `bin_width_s` | 秒 | 单 bin 时间宽；单程距离间隔为 `c*bin_width_s/2` |
-| `num_laser_periods` | 次 | 每像素累计的激光周期数；每周期最多记录最早一个光子 |
-| `pulse_fwhm_s` | 秒 | 高斯系统脉冲的时间半高全宽，不是激光周期长度 |
-| `reference_distance_m` | 米 | 参考信号通量对应的单程距离，其他距离按 `1/r²` 缩放 |
-| `signal_photons_per_pulse_at_reference` | 探测光子/像素/周期 | 在参考距离且反射率为 1.0 时的期望信号光子数，已包含损耗与 PDE |
-| `background_photons_per_bin` | 探测光子/像素/bin/周期 | 每个等宽 bin 的期望背景光子数 |
-| `random_seed` | 非负整数 | 固定后可复现；批量运行据此为各场景派生稳定种子 |
-
-参考反射率固定归一化为 `1.0`，不是独立配置字段。场景反射率会乘到
-参考信号通量上：例如 `constant_reflectivity=0.5` 表示所有像素都使用
-参考目标一半的相对反射率；在当前参考信号 `0.05` 下，参考距离处得到
-`0.025` 探测光子/像素/周期。
-
-NYU 批量字段中，`dataset_root` 是只读数据根目录，`split` 只能选择
-`train` 或 `val`，`start` 是排序后配对 ID 的零基起点，`limit` 是最多
-处理数量。`limit=None` 表示从 `start` 起处理该 split 的全部剩余样本。
-`reflectivity_mode="constant"` 使用统一的合成相对反射率；可见光 RGB
-不是经标定的 NIR 反射率，不应直接按物理 NIR 反射率解释。
-
-几何适配对 RGB 与深度使用完全相同的中心裁剪。640×480 输入裁成
-640×320 后缩放至 240×120；RGB 使用双线性，米制深度使用最近邻，
-以免在深度不连续处混合前景和背景距离。
-
-## NYU Depth V2 轻量数据加载
-
-`NYUDepthV2Loader` 以只读方式打开本地配对数据：
+调试目录至少包含：
 
 ```text
-nyu-depth/
-  images/{train,val}/nyu_XXXX.jpg
-  depth/{train,val}/nyu_XXXX.npy
+input_depth_z_m.npy
+input_reflectivity.npy
+true_slant_range_m.npy
+ray_direction_z.npy
+reconstructed_slant_range_m.npy
+slant_range_bias_m.npy
+depth_to_slant_delta_m.npy
+valid_mask.npy
+detected_counts.npy
+no_detection_counts.npy
+ideal_peak_bin.npy
+observed_peak_bin.npy
+peak_shift_bins.npy
+measured_detection_fraction.npy
+expected_detection_fraction.npy
+diagnostics.json
+config_snapshot.json
+run_status.json
+RUN_README.txt
 ```
 
-对于 640×480 源数据和 240×120 目标阵列，RGB 与深度使用完全相同的
-中心裁剪：
+当 `save_debug_ewh=True` 时还保存 `ewh_counts.npy`。所有 NPY 都禁用 pickle，
+可用 `numpy.load(path, allow_pickle=False)` 读取。RGB 与理想瞬态不重复落盘，
+因为输入数组、内参、IRF 路径和配置快照足以重建它们。
+
+程序禁止覆盖既有运行目录，并拒绝把输出写入 NYU 数据集目录。
+
+## 内存与运行成本
+
+480×640×672 的一个 float32 瞬态或 int32 EWH 各占：
 
 ```text
-裁剪 [left, top, right, bottom] = [0, 80, 640, 400]
-640×480 -> 居中裁成 640×320 -> 240×120
+825,753,600 bytes = 787.50 MiB = 825.75 MB
 ```
 
-RGB 使用双线性 resize。米制深度使用最近邻 resize，避免在距离不连续
-边界混合前景与背景。源 float16、Fortran-order NPY 数组会转换为
-C-contiguous float32 米制数组。
+当前瞬态只保留一份完整 HWT，不再同时保留 signal 和 signal+background 两份
+数组。进入首光子采样后，瞬态与 EWH 两个核心 HWT 至少约占 1,575 MiB，
+还需加上随机采样临时数组、几何图和 Python/NumPy 开销。672 个 bin 也意味着
+每场景需要 672 次逐 bin 条件二项采样。
 
-默认反射率模式是 `constant`。可见光 RGB 会返回以供检查，但不会被
-暗中当作已标定的 NIR 反射率。`luminance_proxy` 仅用于用户明确选择的
-合成实验。
+所以：
 
-## 正式 split 批量与单场景调试
+- 正式批量只保留轻量指标，严格逐场景释放；
+- 单场景保存完整 EWH 会额外占 787.50 MiB 磁盘；
+- 默认原生场景适合在内存充足的机器上运行；
+- 单元测试使用小阵列和较少周期，不改变面向用户的默认值。
 
-`NYUBatchConfig` 是正式数据源边界：
+## 测试
 
-| 字段 | 默认值 | 含义 |
-|---|---:|---|
-| `dataset_root` | 本地 `nyu-depth` | 只读配对数据根目录 |
-| `split` | `val` | 枚举完整训练集或验证集 split |
-| `start` | `0` | 排序后配对 ID 的零基起始位置 |
-| `limit` | `None` | 全部剩余配对样本；正式评估默认值 |
-
-加载器先验证 JPG 与 NPY 的 ID 集合完全相同，再对唯一配对 ID 排序和
-切片。`run_nyu_batch` 按顺序处理每个 ID：
-
-```text
-加载一对 RGB-D
-  -> 适配为 [H,W]
-  -> 运行完整 [H,W,T] 仿真器
-  -> 累计轻量标量指标
-  -> 释放当前场景数组
-  -> 继续下一个 ID
+```powershell
+conda run -n spcsimlib python -B -m unittest discover -s tests -v
 ```
 
-程序不会创建数据集级 RGB、深度、瞬态或 EWH 张量。每个选中场景都会
-获得由基础随机种子和其在排序 split 中的全局索引共同派生的确定性种子，
-因此无论通过全量运行还是 `start/limit` 子集访问，同一场景的 Monte
-Carlo 种子都相同。
+测试覆盖：
 
-最终按像素加权的汇总包括样本数、有效像素比例、实测与理论检测率、
-平均距离偏差、MAE 和 RMSE。逐场景结果只保留 ID 与轻量标量指标。
+- 672×0.75 ns 派生时间窗、距离 bin 与最大无歧义斜距；
+- Toolbox RGB `K` 解析、尺寸校验、单位射线和中心射线；
+- `depth_z_m → slant_range_m`；
+- IRF 列结构、采样间隔、clip、归一化、峰平移、峰前/峰后和质量守恒；
+- HWT shape、空间变化和斜距 `1/r²` 通量；
+- 固定 seed、逐像素周期守恒、低/高通量 pile-up；
+- 最大-bin 斜距单位与空间梯度；
+- NYU 配对枚举、原生尺寸与流式多场景；
+- 批量/调试输出目录、配置快照和几何诊断数组。
 
-`debug_single_scene.py --sample-id ...` 是刻意分离的调试命令，只用于
-检查单个场景的裁剪、shape、直方图与重建行为，不能作为正式 split
-benchmark。因此 `example_config.py` 和批量入口中均不存在 `sample_id`。
+## 与 SPCSImLib 的关键区别
 
-## 精确聚合首光子采集
+本项目把“每周期最多一个最早探测”作为采集层的核心数据契约。EWH 的不同
+bin 不是相互独立采样，因此可自然复现 pile-up。配置明确分开用户输入、相机
+几何、场景轴向深度、派生时间/距离量和输出策略；每个模块有小规模可重复
+测试。SPCSImLib 只作为历史参考，未被修改或复制。
 
-对于每个 bin 的期望光子数为 `lambda[k]` 的独立 Poisson 到达过程，
-某周期到达 bin `k` 且在此首次探测到光子的概率为：
+## 第一版明确未实现
 
-```text
-P(K=k) = exp(-sum(lambda[j], j<k)) * (1 - exp(-lambda[k]))
-```
+- Coates 或其他 pile-up 反演/校正；
+- 白墙实测标定、逐像素 TDC offset、固定图样噪声 FPN；
+- TDC jitter、DNL、INL、量化 offset；
+- 跨周期 dead time、afterpulsing、crosstalk；
+- 前沿、质心、匹配滤波等重建；
+- 多径、多回波、复杂瞬态分解；
+- RGB 畸变校正或 depth 相机到 RGB 的重新投影；
+- RGB 亮度到真实 NIR 反射率的标定。
 
-仿真器不会创建规模过大的 `[H,W,P]` 事件张量，而是维护到达每个 bin
-时仍未探测的周期数：
-
-```text
-remaining = P
-for k in range(T):
-    q = 1 - exp(-lambda[..., k])
-    counts[..., k] ~ Binomial(remaining, q)
-    remaining -= counts[..., k]
-no_detection = remaining
-```
-
-这种条件二项分解与逐周期独立仿真并在最早光子处停止具有完全相同的聚合
-分布，能够自然产生高通量 pile-up 与峰位前移。对每个像素都强制满足
-`sum(EWH) + no_detection == P`。
-
-在 120×240×190 下，一个 float32 HWT 张量约占 20.87 MiB，一个 int32
-EWH 也约占 20.87 MiB。若显式保存配置的 20,000 个周期，则会产生
-5.76 亿个元素；即使使用 int16，也约占 1.07 GiB，且尚未包含其他数组。
-因此正式路径的内存复杂度为 `O(HWT)`，不存在脉冲维度。
-
-## 模块
-
-- `flash_dtof/config.py`：`SensorConfig`、`SceneInputs` 与派生约束。
-- `flash_dtof/scene.py`：NYU 配对加载、裁剪/缩放与反射率策略。
-- `flash_dtof/batch.py`：split 选择、流式运行器与汇总指标。
-- `flash_dtof/transient.py`：向量化逐像素高斯瞬态。
-- `flash_dtof/first_photon.py`：解析概率与条件二项首光子聚合。
-- `flash_dtof/ewh.py`：EWH 契约与逐像素周期守恒。
-- `flash_dtof/reconstruction.py`：仅实现向量化最大 bin 测距。
-- `flash_dtof/pipeline.py`：仿真编排与诊断图。
-- `run_simulation.py`：不含 `sample_id` 的正式 split 批量入口。
-- `debug_single_scene.py`：显式单场景调试命令。
-- `tests/`：完整阵列、shape、守恒、种子、pile-up、距离梯度、单位、
-  唯一配对枚举、limit 行为、多场景流式处理和 NYU 加载测试。
-
-## 明确未实现
-
-版本 0.3 不包含 Coates 或其他 pile-up 反演/校正、前沿法、质心法、
-匹配滤波、亚 bin 重建、TDC offset/DNL/jitter、跨周期 dead time、
-多径或多回波。这些能力保留为后续显式扩展，不会隐藏在当前基线中。
+当前输出是“单回波、首光子 SPAD 阵列、EWH、最大-bin 斜距”的基础可运行
+仿真基线，并不代表后续高级物理模块已经完成。

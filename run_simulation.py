@@ -3,8 +3,13 @@
 import argparse
 from dataclasses import replace
 
-from example_config import NYU_BATCH_CONFIG, SENSOR_CONFIG
+from example_config import CAMERA_CONFIG, NYU_BATCH_CONFIG, OUTPUT_CONFIG, SENSOR_CONFIG
 from flash_dtof.batch import format_batch_summary, run_nyu_batch
+from flash_dtof.output import (
+    initialize_batch_output,
+    save_batch_results,
+    write_run_status,
+)
 
 
 def _parse_args():
@@ -38,6 +43,12 @@ def _with_cli_overrides(batch_config, args):
 def main():
     args = _parse_args()
     batch_config = _with_cli_overrides(NYU_BATCH_CONFIG, args)
+    run_directory = initialize_batch_output(
+        OUTPUT_CONFIG,
+        SENSOR_CONFIG,
+        CAMERA_CONFIG,
+        batch_config,
+    )
 
     print("NYU FORMAL STREAMING BATCH")
     print("  dataset root                : {}".format(batch_config.dataset_root))
@@ -53,6 +64,7 @@ def main():
         SENSOR_CONFIG.num_laser_periods,
     ))
     print("  memory policy               : one scene at a time")
+    print("  output directory            : {}".format(run_directory))
     print()
 
     def report_progress(completed, total, metrics):
@@ -71,13 +83,21 @@ def main():
                 )
             )
 
-    summary = run_nyu_batch(
-        SENSOR_CONFIG,
-        batch_config,
-        progress_callback=report_progress,
-    )
+    try:
+        summary = run_nyu_batch(
+            SENSOR_CONFIG,
+            batch_config,
+            CAMERA_CONFIG,
+            progress_callback=report_progress,
+        )
+        saved_paths = save_batch_results(run_directory, summary)
+    except Exception as error:
+        write_run_status(run_directory, "failed", error=error)
+        raise
     print()
     print(format_batch_summary(summary))
+    print("  summary JSON                : {}".format(saved_paths["summary_metrics"]))
+    print("  per-scene CSV               : {}".format(saved_paths["scene_metrics"]))
 
 
 if __name__ == "__main__":
