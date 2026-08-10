@@ -18,7 +18,8 @@ class NYUBatchConfig:
     """用户设置的 NYU split 选择参数，不包含单样本正式入口。
 
     ``limit=None`` 表示评估从 ``start`` 起的所有剩余配对样本。运行器始终
-    逐场景执行加载、仿真、汇总和释放。
+    逐场景执行加载、仿真、汇总和释放。反射率可为常数，也可使用经过
+    sRGB 线性化的可见光相对代理；后者只调制主动回波，不代表 NIR 标定值。
     """
 
     dataset_root: Path
@@ -27,6 +28,9 @@ class NYUBatchConfig:
     limit: Optional[int] = None
     reflectivity_mode: str = "constant"
     constant_reflectivity: float = 0.5
+    relative_proxy_ratio_min: float = 0.05
+    relative_proxy_ratio_max: float = 20.0
+    relative_proxy_luminance_epsilon: float = 1e-6
 
     def __post_init__(self):
         object.__setattr__(self, "dataset_root", Path(self.dataset_root))
@@ -40,10 +44,28 @@ class NYUBatchConfig:
             or self.limit <= 0
         ):
             raise ValueError("limit must be None or a positive integer")
-        if self.reflectivity_mode not in ("constant", "luminance_proxy"):
+        if self.reflectivity_mode not in ("constant", "rgb_relative_proxy"):
             raise ValueError("invalid reflectivity_mode")
         if not 0.0 <= self.constant_reflectivity <= 1.0:
             raise ValueError("constant_reflectivity must be in [0, 1]")
+        if (
+            not np.isfinite(self.relative_proxy_ratio_min)
+            or self.relative_proxy_ratio_min <= 0.0
+        ):
+            raise ValueError("relative_proxy_ratio_min must be finite and positive")
+        if (
+            not np.isfinite(self.relative_proxy_ratio_max)
+            or self.relative_proxy_ratio_max < 1.0
+            or self.relative_proxy_ratio_max < self.relative_proxy_ratio_min
+        ):
+            raise ValueError("invalid relative_proxy_ratio_max")
+        if (
+            not np.isfinite(self.relative_proxy_luminance_epsilon)
+            or self.relative_proxy_luminance_epsilon <= 0.0
+        ):
+            raise ValueError(
+                "relative_proxy_luminance_epsilon must be finite and positive"
+            )
 
 
 @dataclass(frozen=True)
@@ -116,6 +138,11 @@ def run_nyu_batch(
         expected_size_wh=(sensor_config.image_width, sensor_config.image_height),
         reflectivity_mode=batch_config.reflectivity_mode,
         constant_reflectivity=batch_config.constant_reflectivity,
+        relative_proxy_ratio_min=batch_config.relative_proxy_ratio_min,
+        relative_proxy_ratio_max=batch_config.relative_proxy_ratio_max,
+        relative_proxy_luminance_epsilon=(
+            batch_config.relative_proxy_luminance_epsilon
+        ),
     )
     sample_ids = loader.select_sample_ids(
         batch_config.split,

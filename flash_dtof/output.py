@@ -441,7 +441,7 @@ RGB 与理想瞬态不重复落盘；理想瞬态可由输入数组和配置快�
 def _array_meaning(filename):
     meanings = {
         "input_depth_z_m.npy": "RGB 光轴方向米制轴向深度 z [H,W]",
-        "input_reflectivity.npy": "无量纲合成反射率 [H,W]",
+        "input_reflectivity.npy": "无量纲反射率 [H,W]；来自常数或 RGB 相对代理配置",
         "true_slant_range_m.npy": "由 z/d_z 得到的米制真实斜距 [H,W]",
         "ray_direction_z.npy": "RGB 单位像素射线的 z 分量 d_z [H,W]",
         "ewh_counts.npy": "每 bin 首光子计数 [H,W,T]",
