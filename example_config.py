@@ -76,11 +76,21 @@ NYU_BATCH_CONFIG = NYUBatchConfig(
     # 最多处理多少场景；None 表示从 start 起处理该 split 的全部剩余场景。
     # 开发时可临时设为较小正整数，正式全量评估保持 None。
     limit=None,
-    # "constant" 为常数反射率；"luminance_proxy" 只用于明确的合成实验。
-    # NYU JPG 是可见光 RGB，不能当作经过标定的 NIR 反射率。
+    # 反射率模式："constant" 为全图常数；"rgb_relative_proxy" 对 NYU
+    # sRGB 线性化后用 Rec.709 亮度构造相对明暗代理。RGB 只调制主动回波
+    # 信号，背景光仍由 SensorConfig 的固定背景参数决定。
     reflectivity_mode="constant",
-    # 仅 constant 模式生效，范围 [0,1]。0.5 表示参考反射率 1.0 的一半。
+    # 无量纲目标反射率，范围 [0,1]。constant 模式下是每个像素的固定值；
+    # rgb_relative_proxy 模式下是整幅有效场景的目标平均值。0.5 表示目标
+    # 平均回波系数为参考反射率 1.0 的一半。
     constant_reflectivity=0.5,
+    # RGB 相对亮度比例下限（无量纲），避免黑暗像素被压到严格零回波。
+    relative_proxy_ratio_min=0.05,
+    # RGB 相对亮度比例上限（无量纲），抑制局部高光产生极端信号倍率。
+    relative_proxy_ratio_max=20.0,
+    # 线性 Rec.709 亮度的有效判定阈值（无量纲）；整图没有超过该阈值的
+    # 亮度时安全回退为 constant_reflectivity 常数图。
+    relative_proxy_luminance_epsilon=1e-6,
 )
 
 

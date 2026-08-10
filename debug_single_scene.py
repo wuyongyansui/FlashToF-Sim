@@ -60,6 +60,11 @@ def main():
         expected_size_wh=(SENSOR_CONFIG.image_width, SENSOR_CONFIG.image_height),
         reflectivity_mode=NYU_BATCH_CONFIG.reflectivity_mode,
         constant_reflectivity=NYU_BATCH_CONFIG.constant_reflectivity,
+        relative_proxy_ratio_min=NYU_BATCH_CONFIG.relative_proxy_ratio_min,
+        relative_proxy_ratio_max=NYU_BATCH_CONFIG.relative_proxy_ratio_max,
+        relative_proxy_luminance_epsilon=(
+            NYU_BATCH_CONFIG.relative_proxy_luminance_epsilon
+        ),
     )
     try:
         camera_intrinsics = load_nyu_rgb_intrinsics(CAMERA_CONFIG, SENSOR_CONFIG)

@@ -74,6 +74,33 @@ ToF `2·range/c`、参考信号的 `1/r²` 缩放、重建真值与误差评估�
 配合 Toolbox 的 RGB 针孔内参；这一点是当前唯一仍需用数据来源文档或实测
 投影进一步确认的几何假设。
 
+## 反射率模式
+
+`NYUBatchConfig.reflectivity_mode` 支持两种模式：
+
+- `constant`：所有像素使用 `constant_reflectivity`；
+- `rgb_relative_proxy`：从与深度对齐的 NYU JPG 构造可见光相对反射率代理。
+
+代理模式先把 8-bit sRGB 归一化并按标准分段函数线性化，再计算 Rec.709
+线性亮度：
+
+```text
+Y = 0.2126 R_linear + 0.7152 G_linear + 0.0722 B_linear
+ratio = clip(Y / median(Y_valid), ratio_min, ratio_max)
+reflectivity = clip(scale * ratio, 0, 1)
+```
+
+其中 `scale` 通过单调二分求解，使全图反射率平均值等于
+`constant_reflectivity`。默认比例保护范围为 `[0.05,20]`；全黑、没有有效
+亮度或数值异常时回退为目标值的常数图。由于物理上限 `[0,1]` 会截断高光，
+缩放不会严格保持每个像素原始亮度比，但目标均值仍在 float32 数值精度内
+保持。
+
+这个模式只是可见光明暗的相对代理，不是经过光谱响应、材料属性或主动激光
+波长标定的真实 NIR 反射率。RGB 只进入主动回波信号项；均匀环境背景仍完全
+由 `background_photons_per_bin` 控制，不会从 RGB 推断。调试输出中的
+`input_reflectivity.npy` 保存实际送入瞬态生成器的反射率图。
+
 ## 实测 IRF
 
 默认只读文件：
@@ -226,6 +253,8 @@ conda run -n spcsimlib python -B -m unittest discover -s tests -v
 - `depth_z_m → slant_range_m`；
 - IRF 列结构、采样间隔、clip、归一化、峰平移、峰前/峰后和质量守恒；
 - HWT shape、空间变化和斜距 `1/r²` 通量；
+- sRGB 线性化、Rec.709 相对代理、目标均值/范围和全黑回退；
+- RGB 反射率只调制主动回波、固定背景不随 RGB 变化；
 - 固定 seed、逐像素周期守恒、低/高通量 pile-up；
 - 最大-bin 斜距单位与空间梯度；
 - NYU 配对枚举、原生尺寸与流式多场景；
