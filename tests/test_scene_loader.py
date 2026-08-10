@@ -74,6 +74,21 @@ class NYUSceneLoaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "crop/resize is disabled"):
             loader.load("nyu_0000", split="val")
 
+    def test_aligned_rgb_relative_proxy_has_target_mean_and_spatial_variation(self):
+        loader = NYUDepthV2Loader(
+            DATASET_ROOT,
+            expected_size_wh=(640, 480),
+            reflectivity_mode="rgb_relative_proxy",
+            constant_reflectivity=0.5,
+        )
+        loaded = loader.load("nyu_0000", split="val")
+        reflectivity = loaded.scene_inputs.reflectivity
+        self.assertEqual(reflectivity.shape, loaded.scene_inputs.depth_z_m.shape)
+        self.assertGreaterEqual(float(np.min(reflectivity)), 0.0)
+        self.assertLessEqual(float(np.max(reflectivity)), 1.0)
+        self.assertGreater(float(np.std(reflectivity)), 0.01)
+        self.assertAlmostEqual(float(np.mean(reflectivity)), 0.5, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
